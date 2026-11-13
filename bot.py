@@ -21,7 +21,7 @@ async def handle_text(message: Message):
     
     # 1. gTTS orqali ovoz yaratish
     audio_path = "voice.mp3"
-    tts = gTTS(text=text, lang='uz')
+    tts = gTTS(text=text, lang='en')
     tts.save(audio_path)
     
     # 2. Playwright orqali animatsiya render qilish
