@@ -8719,3 +8719,615 @@ def get_incidents(limit=50):
 def get_admin_history(limit=50):
     return security_center.get_admin_history(limit)
     
+                "permissions": approved_permissions,
+                "reviewed_by": int(reviewed_by),
+                "time": self._now(),
+            })
+
+            try:
+                self._save_state()
+
+            except Exception:
+
+                self.state["modules"][module_name] = old_module
+
+                if old_permissions is None:
+                    self.state["permissions"].pop(
+                        module_name,
+                        None,
+                    )
+                else:
+                    self.state["permissions"][
+                        module_name
+                    ] = old_permissions
+
+                raise
+
+            final_status = module["status"]
+
+        logger.info(
+            "Modul ko'rib chiqildi: %s, holat: %s",
+            module_name,
+            final_status,
+        )
+
+        return {
+            "success": True,
+            "status": final_status,
+            "module": module_name,
+            "permissions": approved_permissions,
+        }
+
+    # ========================================================
+    # 16. ADMIN FAOLIYATI TARIXI
+    # ========================================================
+
+    def get_admin_history(self, limit=50):
+
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 1
+        ):
+            raise ValueError(
+                "Limit musbat butun son bo'lishi kerak."
+            )
+
+        with self.lock:
+
+            return copy.deepcopy(
+                self.state["admin_history"][-limit:]
+            )
+
+    # ========================================================
+    # 17. AMALLARGA RUXSATNI TEKSHIRISH
+    # ========================================================
+
+    def authorize_action(
+        self,
+        module_name,
+        action_name,
+    ):
+
+        with self.lock:
+
+            module = self.state["modules"].get(
+                module_name
+            )
+
+            if module is None:
+                return False
+
+            if module.get("status") != "APPROVED":
+                return False
+
+            allowed_permissions = self.state[
+                "permissions"
+            ].get(module_name, [])
+
+            return (
+                "*" in allowed_permissions
+                or action_name in allowed_permissions
+            )
+
+    # ========================================================
+    # 18. KANALLAR GURUHLARINI BOSHQARISH
+    # ========================================================
+
+    def set_channel_group(
+        self,
+        group_name,
+        channels,
+    ):
+
+        if group_name not in CHANNEL_GROUPS:
+            raise ValueError(
+                "Bunday kanal guruhi mavjud emas."
+            )
+
+        if not isinstance(channels, list):
+            raise TypeError(
+                "Kanallar ro'yxat ko'rinishida berilishi kerak."
+            )
+
+        if len(channels) > MAX_CHANNELS_PER_GROUP:
+            raise ValueError(
+                "Bir guruhda ko'pi bilan 10 ta kanal bo'lishi mumkin."
+            )
+
+        normalized = []
+
+        for channel in channels:
+
+            if isinstance(channel, bool):
+                raise ValueError(
+                    "Kanal ID yoki username bo'lishi kerak."
+                )
+
+            if not isinstance(channel, (str, int)):
+                raise ValueError(
+                    "Kanal ID yoki username bo'lishi kerak."
+                )
+
+            channel = str(channel).strip()
+
+            if not channel:
+                raise ValueError(
+                    "Bo'sh kanal qiymati qabul qilinmaydi."
+                )
+
+            if channel not in normalized:
+                normalized.append(channel)
+
+        with self.lock:
+
+            old_value = copy.deepcopy(
+                self.state["channel_groups"].get(group_name, [])
+            )
+
+            self.state["channel_groups"][
+                group_name
+            ] = normalized
+
+            try:
+                self._save_state()
+            except Exception:
+                self.state["channel_groups"][group_name] = old_value
+                raise
+
+        return True
+
+    def get_channel_group(self, group_name):
+
+        if group_name not in CHANNEL_GROUPS:
+            raise ValueError(
+                "Noto'g'ri kanal guruhi."
+            )
+
+        with self.lock:
+
+            return copy.deepcopy(
+                self.state["channel_groups"][group_name]
+            )
+
+    # ========================================================
+    # 19. FOYDALANUVCHI QOIDABUZARLIKLARI
+    # ========================================================
+
+    def _get_user_record(self, user_id):
+
+        user_id = str(user_id)
+
+        if user_id not in self.state["users"]:
+
+            self.state["users"][user_id] = {
+                "violations": 0,
+                "blocked": False,
+                "permanent_block": False,
+                "spam_restricted_until": 0,
+                "daily_order_limit_override": None,
+                "bonus_balance_override": None,
+                "history": [],
+            }
+
+        return self.state["users"][user_id]
+
+    async def record_violation(
+        self,
+        user_id,
+        reason,
+    ):
+
+        with self.lock:
+
+            user = self._get_user_record(user_id)
+
+            if user["permanent_block"]:
+
+                return {
+                    "success": False,
+                    "status": "PERMANENT_BLOCK",
+                }
+
+            user["violations"] += 1
+
+            violation_number = user["violations"]
+            event_time = self._now()
+
+            if violation_number == 1:
+
+                user["spam_restricted_until"] = (
+                    time.time() + 86400
+                )
+
+                user["daily_order_limit_override"] = 0
+                user["bonus_balance_override"] = 0
+
+                action = "FIRST_VIOLATION_24H_RESTRICTION"
+
+                user_message = (
+                    "Siz qoidalarni buzdingiz. "
+                    "Limitlaringiz va bonuslaringiz 0 ga tushdi. "
+                    "24 soatdan keyin sizga limit beriladi. "
+                    "Iltimos, buni boshqa takrorlamang!"
+                )
+
+            elif violation_number == 2:
+
+                user["blocked"] = True
+
+                action = "SECOND_VIOLATION_BLOCK"
+
+                user_message = (
+                    "Hisobingiz bloklandi. "
+                    "Admin bilan bog'laning."
+                )
+
+            else:
+
+                user["blocked"] = True
+                user["permanent_block"] = True
+
+                action = "PERMANENT_BLOCK"
+
+                user_message = (
+                    "Hisobingiz doimiy bloklandi. "
+                    "Admin bilan bog'laning."
+                )
+
+            history_item = {
+                "violation": violation_number,
+                "reason": str(reason),
+                "time": event_time,
+                "action": action,
+            }
+
+            user["history"].append(history_item)
+
+            try:
+                self._save_state()
+            except Exception:
+                user["violations"] -= 1
+                user["history"].pop()
+                raise
+
+        await self._notify(
+            "FOYDALANUVCHI QOIDABUZARLIGI\n\n"
+            f"Telegram ID: {user_id}\n"
+            f"Vaqt: {event_time}\n"
+            f"Sabab: {reason}\n"
+            f"Qoidabuzarlik: {violation_number}\n"
+            f"Chora: {action}"
+        )
+
+        return {
+            "success": True,
+            "violation": violation_number,
+            "action": action,
+            "user_message": user_message,
+        }
+
+    # ========================================================
+    # 20. FOYDALANUVCHI CHEKLOVLARINI TEKSHIRISH
+    # ========================================================
+
+    def get_user_restrictions(self, user_id):
+
+        with self.lock:
+
+            user = self._get_user_record(user_id)
+            now = time.time()
+
+            if (
+                user["spam_restricted_until"] > 0
+                and now >= user["spam_restricted_until"]
+            ):
+
+                old_until = user["spam_restricted_until"]
+                old_limit = user["daily_order_limit_override"]
+
+                user["spam_restricted_until"] = 0
+                user["daily_order_limit_override"] = None
+
+                # BONUS 0 holatida qoladi.
+                try:
+                    self._save_state()
+                except Exception:
+                    user["spam_restricted_until"] = old_until
+                    user["daily_order_limit_override"] = old_limit
+                    raise
+
+            return {
+                "blocked": user["blocked"],
+                "permanent_block": user["permanent_block"],
+                "spam_restricted": (
+                    user["spam_restricted_until"] > now
+                ),
+                "spam_restricted_until": (
+                    user["spam_restricted_until"]
+                ),
+                "daily_order_limit_override": (
+                    user["daily_order_limit_override"]
+                ),
+                "bonus_balance_override": (
+                    user["bonus_balance_override"]
+                ),
+                "violations": user["violations"],
+            }
+
+    # ========================================================
+    # 21. ADMIN FOYDALANUVCHINI BLOKDAN CHIQARISHI
+    # ========================================================
+
+    def admin_unblock_user(
+        self,
+        user_id,
+        reviewed_by=None,
+    ):
+
+        self._require_admin(reviewed_by)
+
+        with self.lock:
+
+            user = self._get_user_record(user_id)
+
+            if user["permanent_block"]:
+
+                return {
+                    "success": False,
+                    "reason": "PERMANENT_BLOCK",
+                }
+
+            old_blocked = user["blocked"]
+
+            user["blocked"] = False
+
+            user["history"].append({
+                "action": "ADMIN_UNBLOCK",
+                "reviewed_by": int(reviewed_by),
+                "time": self._now(),
+            })
+
+            try:
+                self._save_state()
+            except Exception:
+                user["blocked"] = old_blocked
+                user["history"].pop()
+                raise
+
+            self._add_admin_history({
+                "type": "USER_UNBLOCK",
+                "user_id": str(user_id),
+                "reviewed_by": int(reviewed_by),
+                "time": self._now(),
+            })
+
+            self._save_state()
+
+        return {
+            "success": True,
+            "status": "UNBLOCKED",
+        }
+
+    # ========================================================
+    # 22. ARMIYA TIZIMI
+    # ========================================================
+
+    async def army_report(
+        self,
+        event_type,
+        file_name,
+        description,
+    ):
+
+        event = {
+            "id": str(uuid.uuid4()),
+            "event_type": str(event_type),
+            "file_name": str(file_name),
+            "description": str(description),
+            "time": self._now(),
+        }
+
+        with self.lock:
+
+            self.state["army_events"].append(
+                event
+            )
+
+            self._trim_history(
+                self.state["army_events"]
+            )
+
+            self._save_state()
+
+        await self.report_incident({
+            "source": "ARMY",
+            "event_type": event_type,
+            "file": file_name,
+            "description": description,
+        })
+
+        return True
+
+    # ========================================================
+    # 23. TIZIM HOLATI
+    # ========================================================
+
+    def get_status(self):
+
+        with self.lock:
+
+            modules = self.state["modules"]
+
+            return {
+                "module": MODULE_NAME,
+                "version": VERSION,
+                "initialized": self.initialized,
+                "system_status": self.state.get(
+                    "system_status"
+                ),
+                "admin_id": ADMIN_ID,
+                "admin_connected": self.admin_connected,
+                "registered_modules": len(modules),
+                "approved_modules": sum(
+                    1
+                    for module in modules.values()
+                    if module.get("status") == "APPROVED"
+                ),
+                "pending_modules": sum(
+                    1
+                    for module in modules.values()
+                    if module.get("status") == "PENDING"
+                ),
+                "denied_modules": sum(
+                    1
+                    for module in modules.values()
+                    if module.get("status") == "DENIED"
+                ),
+                "incidents": len(
+                    self.state["incidents"]
+                ),
+                "army_events": len(
+                    self.state["army_events"]
+                ),
+                "users_with_security_records": len(
+                    self.state["users"]
+                ),
+            }
+
+# ============================================================
+# 24. YAGONA XAVFSIZLIK MARKAZI
+# ============================================================
+
+security_center = SecurityCenter()
+
+# ============================================================
+# 25. MODUL TASHQI FUNKSIYALARI
+# ============================================================
+
+def setup(
+    bot,
+    dp,
+    notify_admin,
+    report_security_event=None,
+):
+
+    return security_center.setup(
+        bot=bot,
+        dp=dp,
+        notify_admin=notify_admin,
+        report_security_event=report_security_event,
+    )
+
+def initialize():
+    return security_center.initialize()
+
+def health_check():
+    return security_center.health_check()
+
+async def report_incident(event):
+    return await security_center.report_incident(event)
+
+def register_module(
+    module_name,
+    functions=None,
+    requested_permissions=None,
+):
+
+    return security_center.register_module(
+        module_name,
+        functions,
+        requested_permissions,
+    )
+
+def verify_module_approval(
+    module_name,
+    capabilities=None,
+):
+
+    return security_center.verify_module_approval(
+        module_name,
+        capabilities,
+    )
+
+def review_module(
+    module_name,
+    approved,
+    permissions=None,
+    reviewed_by=None,
+):
+
+    return security_center.review_module(
+        module_name,
+        approved,
+        permissions,
+        reviewed_by,
+    )
+
+def authorize_action(
+    module_name,
+    action_name,
+):
+
+    return security_center.authorize_action(
+        module_name,
+        action_name,
+    )
+
+def set_channel_group(
+    group_name,
+    channels,
+):
+
+    return security_center.set_channel_group(
+        group_name,
+        channels,
+    )
+
+def get_channel_group(group_name):
+    return security_center.get_channel_group(group_name)
+
+async def record_violation(
+    user_id,
+    reason,
+):
+
+    return await security_center.record_violation(
+        user_id,
+        reason,
+    )
+
+def get_user_restrictions(user_id):
+    return security_center.get_user_restrictions(user_id)
+
+def admin_unblock_user(
+    user_id,
+    reviewed_by=None,
+):
+
+    return security_center.admin_unblock_user(
+        user_id,
+        reviewed_by,
+    )
+
+async def army_report(
+    event_type,
+    file_name,
+    description,
+):
+
+    return await security_center.army_report(
+        event_type,
+        file_name,
+        description,
+    )
+
+def get_status():
+    return security_center.get_status()
+
+def get_incidents(limit=50):
+    return security_center.get_incidents(limit)
+
+def get_admin_history(limit=50):
+    return security_center.get_admin_history(limit)
+                
