@@ -4760,4 +4760,2239 @@ class SettingsManager:
 
         return True
 
-    # =========== 
+    # ===========SOZLAMALARNI TO'LIQ TEKSHIRISH
+    # =================================================
+
+    @classmethod
+    def validate_all(cls, settings):
+        errors = []
+
+        if not isinstance(settings, dict):
+            return ["Sozlamalar formati noto'g'ri."]
+
+        defaults = cls._default_settings()
+
+        for section in defaults:
+            if not isinstance(settings.get(section), dict):
+                errors.append(
+                    f"{section} bo'limi mavjud emas yoki noto'g'ri."
+                )
+
+        if errors:
+            return errors
+
+        warnings = settings["users"].get(
+            "premium_warning_days"
+        )
+
+        if (
+            not isinstance(warnings, list)
+            or any(
+                not isinstance(day, int)
+                or isinstance(day, bool)
+                or day < 0
+                for day in warnings
+            )
+            or len(set(warnings)) != len(warnings)
+        ):
+            errors.append(
+                "Premium ogohlantirish kunlari noto'g'ri."
+            )
+
+        tariffs = settings["premium"].get("tariffs")
+
+        if not isinstance(tariffs, dict):
+            errors.append("Premium tariflari noto'g'ri.")
+        else:
+            for level in cls.PREMIUM_LEVELS:
+                tariff = tariffs.get(level)
+
+                if not isinstance(tariff, dict):
+                    errors.append(
+                        f"{level} tarifi mavjud emas."
+                    )
+                    continue
+
+                price = tariff.get("price")
+                duration = tariff.get("duration_days")
+
+                if (
+                    not isinstance(price, (int, float))
+                    or isinstance(price, bool)
+                    or price < 0
+                ):
+                    errors.append(
+                        f"{level} tarifining narxi noto'g'ri."
+                    )
+
+                if (
+                    not isinstance(duration, int)
+                    or isinstance(duration, bool)
+                    or duration <= 0
+                ):
+                    errors.append(
+                        f"{level} tarifining muddati noto'g'ri."
+                    )
+
+        limits = settings["orders"].get("daily_limits")
+
+        if not isinstance(limits, dict):
+            errors.append("Buyurtma limitlari noto'g'ri.")
+        else:
+            for key in (
+                "ODDIY",
+                "PREMIUM_ODDIY",
+                "MAXSUS",
+                "SUPER",
+            ):
+                value = limits.get(key)
+
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                ):
+                    errors.append(
+                        f"{key} buyurtma limiti noto'g'ri."
+                    )
+
+        bonus = settings["bonus"].get("daily_amount")
+
+        if (
+            not isinstance(bonus, (int, float))
+            or isinstance(bonus, bool)
+            or bonus < 0
+        ):
+            errors.append("Kunlik BONUS miqdori noto'g'ri.")
+
+        channels = settings["channels"]
+
+        for group in (
+            "registration_mandatory",
+            "daily_bonus_mandatory",
+            "bonus_channels",
+        ):
+            if not cls._validate_channels(
+                channels.get(group)
+            ):
+                errors.append(
+                    f"{group} kanallar ro'yxati noto'g'ri."
+                )
+
+        buttons = settings["buttons"]
+
+        if not isinstance(buttons, dict):
+            errors.append("Tugmalar sozlamalari noto'g'ri.")
+        else:
+            for key, value in buttons.items():
+                if not isinstance(value, dict):
+                    errors.append(
+                        f"{key} tugmasi sozlamasi noto'g'ri."
+                    )
+                    continue
+
+                if not isinstance(value.get("visible"), bool):
+                    errors.append(
+                        f"{key} tugmasining visible qiymati noto'g'ri."
+                    )
+
+                if not isinstance(value.get("frozen"), bool):
+                    errors.append(
+                        f"{key} tugmasining frozen qiymati noto'g'ri."
+                    )
+
+        duration = settings["security"].get(
+            "admin_panel_duration_minutes"
+        )
+
+        if (
+            not isinstance(duration, int)
+            or isinstance(duration, bool)
+            or not 1 <= duration <= 1440
+        ):
+            errors.append(
+                "Admin panel muddati 1 dan 1440 daqiqagacha bo'lishi kerak."
+            )
+
+        return errors
+
+    # =================================================
+    # ADMIN O'ZGARISH TAKLIFI
+    # =================================================
+
+    async def stage_change(
+        self,
+        admin_id,
+        setting_path,
+        new_value,
+    ):
+        if not await self._check_admin(admin_id):
+            await self._security_event(
+                "Ruxsatsiz sozlama o'zgarishi",
+                f"Admin ID: {admin_id}; sozlama: {setting_path}",
+            )
+            return {
+                "ok": False,
+                "error": "Admin ruxsati mavjud emas.",
+            }
+
+        if not self.initialized:
+            return {
+                "ok": False,
+                "error": "Sozlamalar moduli tayyor emas.",
+            }
+
+        async with self.lock:
+            if setting_path in self.frozen_settings:
+                return {
+                    "ok": False,
+                    "error": "Bu sozlama muzlatilgan.",
+                }
+
+            try:
+                old_value = self._get_nested(
+                    self.settings,
+                    setting_path,
+                )
+
+                candidate = copy.deepcopy(self.settings)
+
+                self._set_nested(
+                    candidate,
+                    setting_path,
+                    new_value,
+                )
+
+            except (KeyError, TypeError):
+                return {
+                    "ok": False,
+                    "error": "Bunday sozlama mavjud emas.",
+                }
+
+            errors = self.validate_all(candidate)
+
+            if errors:
+                return {
+                    "ok": False,
+                    "error": errors,
+                }
+
+            change_id = str(uuid.uuid4())
+
+            self.pending_changes[change_id] = {
+                "change_id": change_id,
+                "admin_id": admin_id,
+                "setting_path": setting_path,
+                "old_value": old_value,
+                "new_value": copy.deepcopy(new_value),
+                "status": "waiting_confirmation",
+                "created_at": self._now(),
+            }
+
+            try:
+                await self._save_locked()
+            except Exception as error:
+                self.pending_changes.pop(change_id, None)
+
+                await self._security_event(
+                    "O'zgarish taklifini saqlashda xato",
+                    str(error),
+                )
+
+                return {
+                    "ok": False,
+                    "error": "Taklifni saqlashda xato.",
+                }
+
+        await self._notify_admin(
+            "SOZLAMA O'ZGARISHI TAKLIF QILINDI\n\n"
+            f"ID: {change_id}\n"
+            f"Sozlama: {setting_path}\n"
+            f"Eski qiymat: {old_value}\n"
+            f"Yangi qiymat: {new_value}\n\n"
+            "Tasdiqlash yoki rad etish mumkin."
+        )
+
+        return {
+            "ok": True,
+            "change_id": change_id,
+            "status": "waiting_confirmation",
+        }
+
+    # =================================================
+    # O'ZGARISHNI TASDIQLASH
+    # =================================================
+
+    async def confirm_change(self, admin_id, change_id):
+        if not await self._check_admin(admin_id):
+            return {
+                "ok": False,
+                "error": "Admin ruxsati mavjud emas.",
+            }
+
+        if not self.initialized:
+            return {
+                "ok": False,
+                "error": "Sozlamalar moduli tayyor emas.",
+            }
+
+        async with self.lock:
+            change = self.pending_changes.get(change_id)
+
+            if not isinstance(change, dict):
+                return {
+                    "ok": False,
+                    "error": "O'zgarish topilmadi.",
+                }
+
+            if change.get("status") != "waiting_confirmation":
+                return {
+                    "ok": False,
+                    "error": "Bu o'zgarish avval ko'rib chiqilgan.",
+                }
+
+            if change.get("admin_id") != admin_id:
+                return {
+                    "ok": False,
+                    "error": "O'zgarishni faqat uni taklif qilgan Admin tasdiqlashi mumkin.",
+                }
+
+            path = change.get("setting_path")
+
+            if path in self.frozen_settings:
+                return {
+                    "ok": False,
+                    "error": "Bu sozlama muzlatilgan.",
+                }
+
+            try:
+                current = self._get_nested(
+                    self.settings,
+                    path,
+                )
+            except KeyError:
+                return {
+                    "ok": False,
+                    "error": "Sozlama topilmadi.",
+                }
+
+            if current != change.get("old_value"):
+                return {
+                    "ok": False,
+                    "error": "Sozlama o'zgargan. Yangi taklif yarating.",
+                }
+
+            candidate = copy.deepcopy(self.settings)
+
+            self._set_nested(
+                candidate,
+                path,
+                change.get("new_value"),
+            )
+
+            errors = self.validate_all(candidate)
+
+            if errors:
+                return {
+                    "ok": False,
+                    "error": errors,
+                }
+
+            old_settings = self.settings
+            old_version = self.version
+            old_change = copy.deepcopy(change)
+
+            new_version = old_version + 1
+
+            # Avval mahalliy tasdiqlangan holat saqlanadi.
+            # Tarqatish esa alohida navbat orqali bajariladi.
+            self.settings = candidate
+            self.version = new_version
+
+            change["status"] = "approved"
+            change["finished_at"] = self._now()
+
+            distribution_id = str(uuid.uuid4())
+
+            self.pending_distribution[distribution_id] = {
+                "distribution_id": distribution_id,
+                "setting_path": path,
+                "value": copy.deepcopy(change["new_value"]),
+                "version": new_version,
+                "targets": {
+                    target: "waiting"
+                    for target in self.DISTRIBUTION_TARGETS
+                },
+                "created_at": self._now(),
+            }
+
+            self.history.append({
+                "admin_id": admin_id,
+                "setting_path": path,
+                "old_value": change["old_value"],
+                "new_value": change["new_value"],
+                "version": new_version,
+                "time": self._now(),
+                "status": "approved",
+            })
+
+            self.history = self.history[-self.MAX_HISTORY:]
+
+            try:
+                await self._save_locked()
+            except Exception as error:
+                self.settings = old_settings
+                self.version = old_version
+                self.pending_distribution.pop(
+                    distribution_id,
+                    None,
+                )
+                self.pending_changes[change_id] = old_change
+                self.history.pop()
+
+                await self._security_event(
+                    "Tasdiqlangan sozlamani saqlashda xato",
+                    str(error),
+                )
+
+                return {
+                    "ok": False,
+                    "error": "Yangi sozlamani saqlash amalga oshmadi.",
+                }
+
+        await self._notify_admin(
+            "SOZLAMA TASDIQLANDI.\n"
+            f"Sozlama: {path}\n"
+            f"Yangi versiya: {new_version}\n"
+            "Boshqa modullarga tarqatish navbatga qo'yildi."
+        )
+
+        return {
+            "ok": True,
+            "version": new_version,
+            "setting_path": path,
+            "distribution_id": distribution_id,
+            "distribution_status": "waiting",
+        }
+
+    # =================================================
+    # SOZLAMANI MODULLARGA TARQATISH
+    # =================================================
+
+    async def sync_pending(self, admin_id):
+        if not await self._check_admin(admin_id):
+            return {
+                "ok": False,
+                "error": "Admin ruxsati mavjud emas.",
+            }
+
+        if self.supra_gateway is None:
+            return {
+                "ok": False,
+                "error": "SUPRA Gateway mavjud emas.",
+            }
+
+        async with self.lock:
+            jobs = copy.deepcopy(
+                self.pending_distribution
+            )
+
+        results = []
+
+        for distribution_id, job in jobs.items():
+            for target, status in job["targets"].items():
+                if status == "delivered":
+                    continue
+
+                request_id = str(uuid.uuid4())
+
+                try:
+                    response = await self.supra_gateway.request(
+                        source=self.MODULE_NAME,
+                        target=target,
+                        command="settings_updated",
+                        payload={
+                            "distribution_id": distribution_id,
+                            "setting_path": job["setting_path"],
+                            "value": copy.deepcopy(job["value"]),
+                            "version": job["version"],
+                        },
+                        request_id=request_id,
+                    )
+
+                    delivered = (
+                        isinstance(response, dict)
+                        and response.get("ok") is True
+                    )
+
+                    if delivered:
+                        result_data = response.get("response")
+
+                        if (
+                            isinstance(result_data, dict)
+                            and result_data.get("ok") is False
+                        ):
+                            delivered = False
+
+                except Exception:
+                    delivered = False
+
+                async with self.lock:
+                    current = self.pending_distribution.get(
+                        distribution_id
+                    )
+
+                    if current:
+                        current["targets"][target] = (
+                            "delivered" if delivered else "waiting"
+                        )
+
+                        try:
+                            await self._save_locked()
+                        except Exception as error:
+                            await self._security_event(
+                                "Tarqatish holatini saqlashda xato",
+                                str(error),
+                            )
+
+                results.append({
+                    "distribution_id": distribution_id,
+                    "target": target,
+                    "delivered": delivered,
+                })
+
+        return {
+            "ok": True,
+            "results": results,
+        }
+
+    # =================================================
+    # O'ZGARISHNI RAD ETISH
+    # =================================================
+
+    async def reject_change(self, admin_id, change_id):
+        if not await self._check_admin(admin_id):
+            return False
+
+        async with self.lock:
+            change = self.pending_changes.get(change_id)
+
+            if not isinstance(change, dict):
+                return False
+
+            if change.get("status") != "waiting_confirmation":
+                return False
+
+            if change.get("admin_id") != admin_id:
+                return False
+
+            old_change = copy.deepcopy(change)
+
+            change["status"] = "rejected"
+            change["finished_at"] = self._now()
+
+            self.history.append({
+                "admin_id": admin_id,
+                "setting_path": change["setting_path"],
+                "old_value": change["old_value"],
+                "new_value": change["new_value"],
+                "time": self._now(),
+                "status": "rejected",
+            })
+
+            self.history = self.history[-self.MAX_HISTORY:]
+
+            try:
+                await self._save_locked()
+            except Exception:
+                self.pending_changes[change_id] = old_change
+                self.history.pop()
+                return False
+
+        await self._notify_admin(
+            f"Sozlama o'zgarishi rad etildi: {change_id}"
+        )
+
+        return True
+
+    # =================================================
+    # SOZLAMANI MUZLATISH
+    # =================================================
+
+    async def freeze_setting(
+        self,
+        admin_id,
+        setting_path,
+        frozen=True,
+    ):
+        if not await self._check_admin(admin_id):
+            return False
+
+        if not isinstance(frozen, bool):
+            return False
+
+        try:
+            self._get_nested(
+                self.settings,
+                setting_path,
+            )
+        except KeyError:
+            return False
+
+        async with self.lock:
+            old_frozen = set(self.frozen_settings)
+
+            if frozen:
+                self.frozen_settings.add(setting_path)
+            else:
+                self.frozen_settings.discard(setting_path)
+
+            try:
+                await self._save_locked()
+            except Exception:
+                self.frozen_settings = old_frozen
+                return False
+
+        await self._notify_admin(
+            f"Sozlama {setting_path}: "
+            + ("MUZLATILDI" if frozen else "FAOLLASHTIRILDI")
+        )
+
+        return True
+
+    # =================================================
+    # SOZLAMALARNI OLISH
+    # =================================================
+
+    async def get_setting(self, setting_path):
+        if not self.initialized:
+            return None
+
+        async with self.lock:
+            try:
+                return self._get_nested(
+                    self.settings,
+                    setting_path,
+                )
+            except KeyError:
+                return None
+
+    async def get_all_settings(self, admin_id):
+        if not await self._check_admin(admin_id):
+            return None
+
+        async with self.lock:
+            return copy.deepcopy(self.settings)
+
+    async def get_history(self, admin_id, limit=50):
+        if not await self._check_admin(admin_id):
+            return None
+
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or limit <= 0
+        ):
+            return None
+
+        async with self.lock:
+            return copy.deepcopy(
+                self.history[-min(limit, self.MAX_HISTORY):]
+            )
+
+    async def get_pending_changes(self, admin_id):
+        if not await self._check_admin(admin_id):
+            return None
+
+        async with self.lock:
+            return copy.deepcopy(self.pending_changes)
+
+    async def get_pending_distribution(self, admin_id):
+        if not await self._check_admin(admin_id):
+            return None
+
+        async with self.lock:
+            return copy.deepcopy(self.pending_distribution)
+
+    # =================================================
+    # KANAL GURUHLARI
+    # =================================================
+
+    async def set_channel_group(
+        self,
+        admin_id,
+        group_name,
+        channels,
+    ):
+        allowed = (
+            "registration_mandatory",
+            "daily_bonus_mandatory",
+            "bonus_channels",
+        )
+
+        if group_name not in allowed:
+            return {
+                "ok": False,
+                "error": "Kanal guruhi nomi noto'g'ri.",
+            }
+
+        if not self._validate_channels(channels):
+            return {
+                "ok": False,
+                "error": "Kanallar ro'yxati noto'g'ri yoki 10 tadan ko'p.",
+            }
+
+        return await self.stage_change(
+            admin_id,
+            f"channels.{group_name}",
+            channels,
+        )
+
+    # =================================================
+    # BUYURTMA LIMITLARI
+    # =================================================
+
+    async def set_order_limit(
+        self,
+        admin_id,
+        category,
+        limit,
+    ):
+        allowed = (
+            "ODDIY",
+            "PREMIUM_ODDIY",
+            "MAXSUS",
+            "SUPER",
+        )
+
+        if category not in allowed:
+            return {
+                "ok": False,
+                "error": "Toifa noto'g'ri.",
+            }
+
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or limit < 0
+        ):
+            return {
+                "ok": False,
+                "error": "Buyurtma limiti noto'g'ri.",
+            }
+
+        return await self.stage_change(
+            admin_id,
+            f"orders.daily_limits.{category}",
+            limit,
+        )
+
+    # =================================================
+    # KUNLIK BONUS
+    # =================================================
+
+    async def set_daily_bonus(self, admin_id, amount):
+        if (
+            not isinstance(amount, (int, float))
+            or isinstance(amount, bool)
+            or amount < 0
+        ):
+            return {
+                "ok": False,
+                "error": "BONUS miqdori noto'g'ri.",
+            }
+
+        return await self.stage_change(
+            admin_id,
+            "bonus.daily_amount",
+            amount,
+        )
+
+    # =================================================
+    # PREMIUM TARIFINI BIRGALIKDA O'ZGARTIRISH
+    # =================================================
+
+    async def set_premium_tariff(
+        self,
+        admin_id,
+        level,
+        price,
+        duration_days,
+    ):
+        if level not in self.PREMIUM_LEVELS:
+            return {
+                "ok": False,
+                "error": "Premium darajasi noto'g'ri.",
+            }
+
+        if (
+            not isinstance(price, (int, float))
+            or isinstance(price, bool)
+            or price < 0
+        ):
+            return {
+                "ok": False,
+                "error": "Tarif narxi noto'g'ri.",
+            }
+
+        if (
+            not isinstance(duration_days, int)
+            or isinstance(duration_days, bool)
+            or duration_days <= 0
+        ):
+            return {
+                "ok": False,
+                "error": "Tarif muddati noto'g'ri.",
+            }
+
+        return await self.stage_change(
+            admin_id,
+            f"premium.tariffs.{level}",
+            {
+                "price": price,
+                "duration_days": duration_days,
+            },
+        )
+
+    # =================================================
+    # SUPRA BUYRUQLARINI QABUL QILISH
+    # =================================================
+
+    async def handle_command(
+        self,
+        command,
+        payload,
+        context=None,
+    ):
+        if not isinstance(payload, dict):
+            return {
+                "ok": False,
+                "error": "Buyruq ma'lumotlari noto'g'ri.",
+            }
+
+        if command == "get_setting":
+            path = payload.get("setting_path")
+
+            if not isinstance(path, str):
+                return {
+                    "ok": False,
+                    "error": "Sozlama nomi noto'g'ri.",
+                }
+
+            value = await self.get_setting(path)
+
+            if value is None:
+                return {
+                    "ok": False,
+                    "error": "Sozlama topilmadi.",
+                }
+
+            return {
+                "ok": True,
+                "value": value,
+                "version": self.version,
+            }
+
+        if command == "stage_change":
+            return await self.stage_change(
+                admin_id=payload.get("admin_id"),
+                setting_path=payload.get("setting_path"),
+                new_value=payload.get("new_value"),
+            )
+
+        if command == "confirm_change":
+            return await self.confirm_change(
+                admin_id=payload.get("admin_id"),
+                change_id=payload.get("change_id"),
+            )
+
+        if command == "reject_change":
+            result = await self.reject_change(
+                admin_id=payload.get("admin_id"),
+                change_id=payload.get("change_id"),
+            )
+            return {"ok": result}
+
+        if command == "freeze_setting":
+            result = await self.freeze_setting(
+                admin_id=payload.get("admin_id"),
+                setting_path=payload.get("setting_path"),
+                frozen=payload.get("frozen", True),
+            )
+            return {"ok": result}
+
+        if command == "set_channel_group":
+            return await self.set_channel_group(
+                admin_id=payload.get("admin_id"),
+                group_name=payload.get("group_name"),
+                channels=payload.get("channels"),
+            )
+
+        if command == "set_order_limit":
+            return await self.set_order_limit(
+                admin_id=payload.get("admin_id"),
+                category=payload.get("category"),
+                limit=payload.get("limit"),
+            )
+
+        if command == "set_daily_bonus":
+            return await self.set_daily_bonus(
+                admin_id=payload.get("admin_id"),
+                amount=payload.get("amount"),
+            )
+
+        if command == "set_premium_tariff":
+            return await self.set_premium_tariff(
+                admin_id=payload.get("admin_id"),
+                level=payload.get("level"),
+                price=payload.get("price"),
+                duration_days=payload.get("duration_days"),
+            )
+
+        if command == "sync_pending":
+            return await self.sync_pending(
+                admin_id=payload.get("admin_id"),
+            )
+
+        return {
+            "ok": False,
+            "error": "Noma'lum sozlama buyrug'i.",
+        }
+
+    # =================================================
+    # MODUL HOLATI
+    # =================================================
+
+    async def health_check(self):
+        async with self.lock:
+            pending_count = sum(
+                1
+                for item in self.pending_changes.values()
+                if isinstance(item, dict)
+                and item.get("status") == "waiting_confirmation"
+            )
+
+            distribution_count = len(
+                self.pending_distribution
+            )
+
+            return {
+                "module": self.MODULE_NAME,
+                "version": self.VERSION,
+                "initialized": self.initialized,
+                "settings_version": self.version,
+                "pending_changes": pending_count,
+                "pending_distribution": distribution_count,
+                "history_records": len(self.history),
+                "frozen_settings": len(self.frozen_settings),
+                "gateway_connected": self.supra_gateway is not None,
+                "admin_verification_configured": callable(
+                    self.is_admin_verified
+                ),
+                "status": (
+                    "healthy"
+                    if self.initialized
+                    else "not_ready"
+                ),
+            }
+
+# =====================================================
+# MODULNI ISHGA TUSHIRISH
+# =====================================================
+
+settings_manager = None
+
+async def setup(
+    supra_gateway=None,
+    is_admin_verified=None,
+    notify_admin=None,
+    report_security_event=None,
+    data_file="sozlamalar_data.json",
+):
+    global settings_manager
+
+    if settings_manager is not None:
+        if settings_manager.initialized:
+            return settings_manager
+
+    manager = SettingsManager(
+        supra_gateway=supra_gateway,
+        is_admin_verified=is_admin_verified,
+        notify_admin=notify_admin,
+        report_security_event=report_security_event,
+        data_file=data_file,
+    )
+
+    initialized = await manager.initialize()
+
+    if not initialized:
+        raise RuntimeError(
+            "Sozlamalar modulini ishga tushirib bo'lmadi."
+        )
+
+    settings_manager = manager
+    return settings_manager
+
+async def initialize():
+    if settings_manager is None:
+        return False
+
+    return await settings_manager.initialize()
+
+async def health_check():
+    if settings_manager is None:
+        return {
+            "module": "sozlamalar",
+            "version": SettingsManager.VERSION,
+            "status": "not_started",
+        }
+
+    return await settings_manager.health_check()
+
+import asyncio
+import logging
+import os
+import re
+import uuid
+
+from pathlib import Path
+from datetime import datetime, timezone
+
+# =====================================================
+# 1. ASOSIY SOZLAMALAR
+# =====================================================
+
+VERSION = "1.0.0"
+
+MODULE_NAME = "foydalanuvchilar"
+
+DATA_FILE = Path("foydalanuvchilar.txt")
+
+MAX_USERS = 1000000
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger(MODULE_NAME)
+
+# =====================================================
+# 2. ASOSIY HOLAT
+# =====================================================
+
+users = {}
+
+initialized = False
+running = False
+
+user_lock = asyncio.Lock()
+
+notify_admin_callback = None
+report_security_callback = None
+
+# =====================================================
+# 3. VAQT
+# =====================================================
+
+def current_time():
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
+
+# =====================================================
+# 4. MA'LUMOTLARNI TOZALASH
+# =====================================================
+
+def clean_text(value):
+    if value is None:
+        return ""
+
+    return " ".join(
+        str(value).replace("\n", " ").replace("\r", " ").split()
+    )
+
+def validate_user_data(
+    telegram_id,
+    name,
+    phone,
+):
+    if not telegram_id or not str(telegram_id).isdigit():
+        raise ValueError(
+            "Telegram ID noto'g'ri."
+        )
+
+    name = clean_text(name)
+
+    if not name or len(name) > 150:
+        raise ValueError(
+            "Foydalanuvchi ismi noto'g'ri."
+        )
+
+    phone = clean_text(phone)
+
+    phone_digits = re.sub(
+        r"[\s()+\-]",
+        "",
+        phone,
+    )
+
+    if not phone_digits.isdigit():
+        raise ValueError(
+            "Telefon raqami noto'g'ri."
+        )
+
+    if not 7 <= len(phone_digits) <= 15:
+        raise ValueError(
+            "Telefon raqami uzunligi noto'g'ri."
+        )
+
+    return {
+        "telegram_id": str(telegram_id),
+        "name": name,
+        "phone": phone,
+    }
+
+# =====================================================
+# 5. FAYLDAN MA'LUMOTLARNI O'QISH
+# =====================================================
+
+def load_users():
+    global users
+
+    if not DATA_FILE.exists():
+        users = {}
+        return True
+
+    loaded = {}
+
+    try:
+        content = DATA_FILE.read_text(
+            encoding="utf-8"
+        )
+
+        blocks = re.split(
+            r"(?m)^\s*(\d+)\)\s*ID:\s*",
+            content,
+        )
+
+        for index in range(1, len(blocks), 2):
+            telegram_id = blocks[index].strip()
+
+            block = blocks[index + 1]
+
+            name_match = re.search(
+                r"(?m)^Nomi:\s*(.*)$",
+                block,
+            )
+
+            phone_match = re.search(
+                r"(?m)^Telefon:\s*(.*)$",
+                block,
+            )
+
+            time_match = re.search(
+                r"(?m)^Ro'yxatdan o'tgan vaqt:\s*(.*)$",
+                block,
+            )
+
+            if not name_match or not phone_match:
+                logger.warning(
+                    "Noto'liq foydalanuvchi yozuvi: %s",
+                    telegram_id,
+                )
+                continue
+
+            loaded[telegram_id] = {
+                "telegram_id": telegram_id,
+                "name": clean_text(name_match.group(1)),
+                "phone": clean_text(phone_match.group(1)),
+                "registration_time": (
+                    clean_text(time_match.group(1))
+                    if time_match
+                    else "Noma'lum"
+                ),
+            }
+
+        users = loaded
+
+        logger.info(
+            "%s ta foydalanuvchi yuklandi.",
+            len(users),
+        )
+
+        return True
+
+    except Exception:
+        logger.exception(
+            "Foydalanuvchilar faylini o'qishda xatolik."
+        )
+        raise
+
+# =====================================================
+# 6. MA'LUMOTLARNI FAYLGA SAQLASH
+# =====================================================
+
+def save_users():
+    temporary = DATA_FILE.with_suffix(
+        DATA_FILE.suffix + ".tmp"
+    )
+
+    DATA_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    try:
+        lines = []
+
+        for index, telegram_id in enumerate(
+            sorted(users, key=lambda item: int(item)),
+            start=1,
+        ):
+            user = users[telegram_id]
+
+            lines.extend([
+                f"{index}) ID: {telegram_id}",
+                f"Nomi: {user['name']}",
+                f"Telefon: {user['phone']}",
+                (
+                    "Ro'yxatdan o'tgan vaqt: "
+                    f"{user['registration_time']}"
+                ),
+                "",
+            ])
+
+        content = "\n".join(lines)
+
+        with open(
+            temporary,
+            "w",
+            encoding="utf-8",
+        ) as file:
+
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+
+        os.replace(
+            temporary,
+            DATA_FILE,
+        )
+
+        # Imkon bo'lsa, fayl ruxsatlarini cheklash.
+        try:
+            os.chmod(DATA_FILE, 0o600)
+        except OSError:
+            logger.warning(
+                "Fayl ruxsatlarini cheklash amalga oshmadi."
+            )
+
+    finally:
+        if temporary.exists():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+# =====================================================
+# 7. MODULNI ISHGA TUSHIRISH
+# =====================================================
+
+async def setup(
+    bot=None,
+    dp=None,
+    notify_admin=None,
+    report_security_event=None,
+):
+    global notify_admin_callback
+    global report_security_callback
+
+    notify_admin_callback = notify_admin
+    report_security_callback = report_security_event
+
+    return True
+
+async def initialize():
+    global initialized
+    global running
+
+    async with user_lock:
+        load_users()
+
+        initialized = True
+        running = True
+
+    logger.info(
+        "FOYDALANUVCHILAR MODULI ISHGA TUSHDI. Versiya: %s",
+        VERSION,
+    )
+
+    return True
+
+# =====================================================
+# 8. MODUL HOLATINI TEKSHIRISH
+# =====================================================
+
+async def health_check():
+    return {
+        "module": MODULE_NAME,
+        "version": VERSION,
+        "ready": initialized,
+        "running": running,
+        "status": "ACTIVE" if running else "STOPPED",
+        "users_count": len(users),
+    }
+
+# =====================================================
+# 9. YANGI FOYDALANUVCHINI RO'YXATDAN O'TKAZISH
+# =====================================================
+
+async def register_user(payload, context=None):
+    if not initialized or not running:
+        raise RuntimeError(
+            "Foydalanuvchilar moduli tayyor emas."
+        )
+
+    if not isinstance(payload, dict):
+        return {
+            "registered": False,
+            "message": "Ma'lumot formati noto'g'ri.",
+        }
+
+    try:
+        data = validate_user_data(
+            payload.get("telegram_id"),
+            payload.get("name"),
+            payload.get("phone"),
+        )
+
+    except ValueError as error:
+        return {
+            "registered": False,
+            "message": str(error),
+        }
+
+    telegram_id = data["telegram_id"]
+
+    async with user_lock:
+
+        existing = users.get(telegram_id)
+
+        if existing:
+            return {
+                "registered": True,
+                "existing": True,
+                "message": "Foydalanuvchi oldin ro'yxatdan o'tgan.",
+            }
+
+        if len(users) >= MAX_USERS:
+            return {
+                "registered": False,
+                "message": "Foydalanuvchilar ombori limiti to'ldi.",
+            }
+
+        user = {
+            "telegram_id": telegram_id,
+            "name": data["name"],
+            "phone": data["phone"],
+            "registration_time": clean_text(
+                payload.get("registration_time")
+            ) or current_time(),
+            "request_id": (
+                context.get("request_id")
+                if isinstance(context, dict)
+                else None
+            ),
+        }
+
+        users[telegram_id] = user
+
+        try:
+            save_users()
+
+        except Exception:
+            users.pop(telegram_id, None)
+
+            logger.exception(
+                "Foydalanuvchini saqlashda xatolik."
+            )
+
+            raise
+
+    logger.info(
+        "Yangi foydalanuvchi ro'yxatdan o'tdi. ID: %s",
+        telegram_id,
+    )
+
+    return {
+        "registered": True,
+        "existing": False,
+        "message": "Foydalanuvchi muvaffaqiyatli saqlandi.",
+    }
+
+# =====================================================
+# 10. SUPRA BUYRUQLARINI QABUL QILISH
+# =====================================================
+
+async def handle_command(
+    command,
+    payload,
+    context,
+):
+    if not initialized or not running:
+        raise RuntimeError(
+            "Foydalanuvchilar moduli ishlamayapti."
+        )
+
+    if command == "register_user":
+        return await register_user(
+            payload,
+            context,
+        )
+
+    if command == "get_user":
+        telegram_id = str(
+            payload.get("telegram_id", "")
+        )
+
+        async with user_lock:
+            user = users.get(telegram_id)
+
+            if not user:
+                return {
+                    "found": False,
+                    "message": "Foydalanuvchi topilmadi.",
+                }
+
+            return {
+                "found": True,
+                "user": dict(user),
+            }
+
+    if command == "get_user_count":
+        return {
+            "count": len(users),
+        }
+
+    return {
+        "success": False,
+        "message": "Noma'lum buyruq.",
+    }
+
+# =====================================================
+# 11. FOYDALANUVCHINI QIDIRISH
+# =====================================================
+
+async def get_user(telegram_id):
+    if not initialized:
+        return None
+
+    async with user_lock:
+        user = users.get(
+            str(telegram_id)
+        )
+
+        return dict(user) if user else None
+
+# =====================================================
+# 12. FOYDALANUVCHILAR SONI
+# =====================================================
+
+async def get_user_count():
+    async with user_lock:
+        return len(users)
+
+# =====================================================
+# 13. MODULNI TO'XTATISH
+# =====================================================
+
+async def shutdown():
+    global running
+    global initialized
+
+    async with user_lock:
+        if initialized:
+            save_users()
+
+        running = False
+        initialized = False
+
+    logger.info(
+        "FOYDALANUVCHILAR MODULI TO'XTATILDI."
+    )
+
+    return True
+
+# -*- coding: utf-8 -*-
+"""
+SUPRA — ADMIN MODULE
+VERSION: 2.2.0
+
+Vazifalari:
+- Admin panelini boshqarish
+- Admin huquqini tekshirish
+- Asosiy va ichki menyularni boshqarish
+- Gateway orqali buyruqlar yuborish
+- Modul so'rovlarini tasdiqlash/rad etish
+- Admin faoliyatini Xavfsizlik markaziga qayd etish
+
+Klaviaturalar tugmalar.py modulida yaratiladi.
+main.py o'zgartirilmaydi.
+"""
+
+import asyncio
+import inspect
+import logging
+import uuid
+
+from collections import deque
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import Message, CallbackQuery
+
+# ============================================================
+# 1. MODUL SOZLAMALARI
+# ============================================================
+
+MODULE_NAME = "admin"
+VERSION = "2.2.0"
+
+ADMIN_ID = 8381887071
+DEFAULT_ADMIN_COMMAND = "admin"
+
+SECURITY_MODULE_NAME = "Xavfsizlik_markazi"
+
+router = Router(name="admin_router")
+
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# 2. GLOBAL HOLATLAR
+# ============================================================
+
+bot: Optional[Bot] = None
+dp: Optional[Dispatcher] = None
+
+notify_admin = None
+report_security_event = None
+is_admin_verified = None
+
+supra_gateway = None
+security_center = None
+
+initialized = False
+router_registered = False
+admin_command = DEFAULT_ADMIN_COMMAND
+
+panel_open = False
+
+buttons_setup_task = None
+buttons_manager = None
+
+CALLBACK_CACHE_LIMIT = 500
+processed_callbacks = set()
+processed_callbacks_order = deque(maxlen=CALLBACK_CACHE_LIMIT)
+
+module_requests = {}
+pending_module_requests = {}
+
+# ============================================================
+# 3. BUYRUQLAR VA MODUL YO'NALISHLARI
+# ============================================================
+
+ACTION_TARGETS = {
+    "security_status": SECURITY_MODULE_NAME,
+    "security_incidents": SECURITY_MODULE_NAME,
+    "security_permissions": SECURITY_MODULE_NAME,
+    "security_army": SECURITY_MODULE_NAME,
+    "security_restrictions": SECURITY_MODULE_NAME,
+
+    "users_all": "foydalanuvchilar",
+    "users_search": "foydalanuvchilar",
+    "users_premium": "foydalanuvchilar",
+    "users_restrictions": "foydalanuvchilar",
+    "users_permissions": "foydalanuvchilar",
+}
+
+# ============================================================
+# 4. ASOSIY MENYULAR
+# ============================================================
+
+MAIN_SECTIONS = {
+    "security": "Xavfsizlik",
+    "settings": "Sozlamalar",
+    "users": "Foydalanuvchilar",
+    "orders": "Buyurtmalar",
+    "bonus": "Bonuslar",
+    "reports": "Hisobotlar",
+    "files": "Fayllar",
+    "logs": "Jurnallar",
+}
+
+SUBMENUS = {
+    "security": {
+        "security_status": "Xavfsizlik holati",
+        "security_incidents": "Xavfsizlik hodisalari",
+        "security_permissions": "Ruxsatlar",
+        "security_army": "Himoya tizimi",
+        "security_restrictions": "Cheklovlar",
+    },
+
+    "settings": {
+        "settings_users": "Foydalanuvchilar sozlamalari",
+        "settings_premium": "Premium sozlamalari",
+        "settings_orders": "Buyurtma sozlamalari",
+        "settings_bonus": "Bonus sozlamalari",
+        "settings_channels": "Kanallar",
+        "settings_buttons": "Tugmalar",
+        "settings_security": "Xavfsizlik sozlamalari",
+        "settings_history": "Sozlamalar tarixi",
+    },
+
+    "users": {
+        "users_all": "Barcha foydalanuvchilar",
+        "users_search": "Foydalanuvchini qidirish",
+        "users_premium": "Premium foydalanuvchilar",
+        "users_restrictions": "Foydalanuvchi cheklovlari",
+        "users_permissions": "Foydalanuvchi ruxsatlari",
+    },
+
+    "orders": {
+        "orders_all": "Barcha buyurtmalar",
+        "orders_queue": "Navbatdagi buyurtmalar",
+        "orders_active": "Faol buyurtmalar",
+        "orders_completed": "Yakunlangan buyurtmalar",
+        "orders_cancelled": "Bekor qilingan buyurtmalar",
+    },
+
+    "bonus": {
+        "bonus_users": "Foydalanuvchi bonuslari",
+        "bonus_channels": "Kanal bonuslari",
+        "bonus_history": "Bonuslar tarixi",
+        "bonus_statistics": "Bonus statistikasi",
+    },
+
+    "reports": {
+        "reports_users": "Foydalanuvchilar hisoboti",
+        "reports_orders": "Buyurtmalar hisoboti",
+        "reports_payments": "To'lovlar hisoboti",
+        "reports_bonus": "Bonuslar hisoboti",
+        "reports_system": "Tizim hisoboti",
+    },
+
+    "files": {
+        "files_status": "Fayllar holati",
+        "files_connections": "Ulanishlar",
+        "files_permissions": "Fayl ruxsatlari",
+        "files_backup": "Zaxira nusxa",
+        "files_restore": "Tiklash",
+    },
+
+    "logs": {
+        "logs_system": "Tizim jurnali",
+        "logs_admin": "Admin jurnali",
+        "logs_security": "Xavfsizlik jurnali",
+        "logs_errors": "Xatoliklar jurnali",
+    },
+}
+
+EXTRA_ACTIONS = {
+    "broadcast": "Xabar yuborish",
+    "contact": "Aloqa",
+    "feedback": "Fikr-mulohazalar",
+    "payments": "To'lovlar",
+    "inquiries": "Murojaatlar",
+    "statistics": "Statistika",
+    "panel_duration": "Panel davomiyligi",
+    "close_panel": "Panelni yopish",
+}
+
+# ============================================================
+# 5. YORDAMCHI FUNKSIYALAR
+# ============================================================
+
+async def call_maybe_async(function, *args, **kwargs):
+    """Oddiy yoki async funksiyani chaqiradi."""
+    if function is None:
+        return None
+
+    result = function(*args, **kwargs)
+
+    if inspect.isawaitable(result):
+        return await result
+
+    return result
+
+def utc_now() -> str:
+    """UTC vaqtini ISO formatida qaytaradi."""
+    return datetime.now(timezone.utc).isoformat()
+
+def valid_admin_id(user_id: Any) -> bool:
+    """Telegram ID qiymatini tekshiradi."""
+    try:
+        return int(user_id) == ADMIN_ID
+    except (TypeError, ValueError):
+        return False
+
+async def admin_verified(user_id: Any) -> bool:
+    """
+    Admin ID va Xavfsizlik markazining tasdig'ini tekshiradi.
+    Faqat ADMIN_ID bo'lishning o'zi yetarli emas.
+    """
+    if not valid_admin_id(user_id):
+        return False
+
+    if is_admin_verified is None:
+        return False
+
+    try:
+        result = await call_maybe_async(
+            is_admin_verified,
+            int(user_id)
+        )
+        return bool(result)
+    except Exception:
+        logger.exception("Admin huquqini tekshirishda xatolik")
+        return False
+
+async def send_admin_message(text: str, **kwargs):
+    """Admin ID ga xabar yuboradi."""
+    if notify_admin is not None:
+        try:
+            return await call_maybe_async(
+                notify_admin,
+                text,
+                **kwargs
+            )
+        except TypeError:
+            return await call_maybe_async(notify_admin, text)
+
+    if bot is not None:
+        return await bot.send_message(ADMIN_ID, text, **kwargs)
+
+    return None
+
+async def security_report(event: str, details: Any = None):
+    """Xavfsizlik hodisasini qayd etish."""
+    if report_security_event is None:
+        return False
+
+    try:
+        await call_maybe_async(
+            report_security_event,
+            event,
+            details
+        )
+        return True
+    except TypeError:
+        try:
+            await call_maybe_async(
+                report_security_event,
+                {
+                    "module": MODULE_NAME,
+                    "event": event,
+                    "details": details,
+                    "time": utc_now(),
+                }
+            )
+            return True
+        except Exception:
+            logger.exception("Xavfsizlik hodisasini yuborib bo'lmadi")
+    except Exception:
+        logger.exception("Xavfsizlik hodisasini yuborib bo'lmadi")
+
+    return False
+
+async def record_admin_activity(action: str, details: Any = None):
+    """
+    Admin faoliyatini Xavfsizlik markazining OMMAVIY API
+    funksiyasi orqali qayd etadi.
+
+    Xavfsizlik markazining ichki state yoki _save_state()
+    metodiga bevosita murojaat qilinmaydi.
+    """
+    if security_center is None:
+        return False
+
+    writer = getattr(
+        security_center,
+        "record_admin_activity",
+        None
+    )
+
+    if not callable(writer):
+        logger.warning(
+            "Xavfsizlik markazida record_admin_activity() "
+            "ommaviy funksiyasi mavjud emas"
+        )
+        return False
+
+    try:
+        result = await call_maybe_async(
+            writer,
+            action=action,
+            details=details,
+            admin_id=ADMIN_ID,
+        )
+        return result is not False
+    except Exception:
+        logger.exception("Admin faoliyatini qayd etishda xatolik")
+        return False
+
+def remember_callback(callback_id: str) -> bool:
+    """Callback takroran bajarilishini cheklaydi."""
+    if not callback_id:
+        return False
+
+    if callback_id in processed_callbacks:
+        return False
+
+    if len(processed_callbacks_order) >= CALLBACK_CACHE_LIMIT:
+        old_id = processed_callbacks_order.popleft()
+        processed_callbacks.discard(old_id)
+
+    processed_callbacks.add(callback_id)
+    processed_callbacks_order.append(callback_id)
+
+    return True
+
+# ============================================================
+# 6. TUGMALAR MODULI BILAN INTEGRATSIYA
+# ============================================================
+
+def _buttons_module():
+    """Tugmalar modulini import qiladi."""
+    import tugmalar
+    return tugmalar
+
+def main_menu_keyboard():
+    """Admin asosiy klaviaturasini tugmalar.py dan oladi."""
+    return _buttons_module().get_admin_main_menu(
+        MAIN_SECTIONS,
+        EXTRA_ACTIONS
+    )
+
+def submenu_keyboard(section: str):
+    """Ichki menyu klaviaturasini tugmalar.py dan oladi."""
+    items = SUBMENUS.get(section)
+
+    if items is None:
+        raise ValueError(f"Noma'lum Admin bo'limi: {section}")
+
+    return _buttons_module().get_admin_submenu(items)
+
+def extra_menu_keyboard():
+    """Qo'shimcha amallar klaviaturasi."""
+    return _buttons_module().get_admin_extra_menu(
+        EXTRA_ACTIONS
+    )
+
+def module_review_keyboard(token: str):
+    """Modulni ko'rib chiqish klaviaturasi."""
+    return _buttons_module().get_module_review_keyboard(token)
+
+async def _authorize_buttons_source(source: str) -> bool:
+    """
+    Tugmalar yordamchi moduli Gateway bilan ishlaganda
+    Admin orqali ruxsat olishini tekshiradi.
+    """
+    if source != "admin":
+        return False
+
+    return await admin_verified(ADMIN_ID)
+
+async def _initialize_buttons_helper():
+    """Tugmalar yordamchi modulini ishga tushiradi."""
+    global buttons_manager
+
+    module = _buttons_module()
+
+    buttons_manager = await module.setup(
+        bot=bot,
+        dp=dp,
+        supra_gateway=supra_gateway,
+        is_source_authorized=_authorize_buttons_source,
+        notify_admin=notify_admin,
+        report_security_event=report_security_event,
+    )
+
+    return buttons_manager
+
+def _schedule_buttons_setup():
+    """Tugmalar modulini joriy event loop ichida ishga tushiradi."""
+    global buttons_setup_task
+
+    if buttons_setup_task is not None:
+        if not buttons_setup_task.done():
+            return buttons_setup_task
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        buttons_setup_task = None
+        return None
+
+    buttons_setup_task = loop.create_task(
+        _initialize_buttons_helper()
+    )
+
+    return buttons_setup_task
+
+# ============================================================
+# 7. GATEWAY ORQALI BUYRUQ YUBORISH
+# ============================================================
+
+def get_target_for_action(
+    action: str,
+    data: Optional[dict] = None,
+    target: Optional[str] = None
+):
+    """
+    Buyruq uchun ruxsat etilgan modulni aniqlaydi.
+
+    Foydalanuvchi yuborgan target qiymati ACTION_TARGETS
+    xaritasini chetlab o'ta olmaydi.
+    """
+    if action == "admin_panel_close":
+        expected_target = SECURITY_MODULE_NAME
+    else:
+        expected_target = ACTION_TARGETS.get(action)
+
+    if expected_target is None:
+        return None
+
+    if target is not None and target != expected_target:
+        return None
+
+    if isinstance(data, dict):
+        supplied_target = data.get("target")
+
+        if (
+            supplied_target is not None
+            and supplied_target != expected_target
+        ):
+            return None
+
+    return expected_target
+
+async def send_to_supra(
+    action: str,
+    data: Optional[dict] = None,
+    target: Optional[str] = None
+):
+    """Gateway orqali boshqa modulga buyruq yuboradi."""
+    if supra_gateway is None:
+        return {
+            "ok": False,
+            "error": "GATEWAY_NOT_AVAILABLE",
+        }
+
+    resolved_target = get_target_for_action(
+        action,
+        data=data,
+        target=target,
+    )
+
+    if resolved_target is None:
+        await security_report(
+            "ADMIN_TARGET_REJECTED",
+            {
+                "action": action,
+                "target": target,
+            }
+        )
+
+        return {
+            "ok": False,
+            "error": "TARGET_NOT_CONFIGURED",
+        }
+
+    payload = data.copy() if isinstance(data, dict) else {}
+
+    # Target foydalanuvchi ma'lumotidan olinmaydi.
+    payload.pop("target", None)
+
+    try:
+        result = await call_maybe_async(
+            supra_gateway.send_command,
+            action,
+            resolved_target,
+            payload,
+        )
+
+        await record_admin_activity(
+            action,
+            {
+                "target": resolved_target,
+                "result": str(result)[:500],
+            }
+        )
+
+        return result
+
+    except Exception as exc:
+        logger.exception("Gateway buyruq yuborishda xatolik")
+
+        await security_report(
+            "ADMIN_GATEWAY_ERROR",
+            {
+                "action": action,
+                "target": resolved_target,
+                "error": str(exc),
+            }
+        )
+
+        return {
+            "ok": False,
+            "error": "GATEWAY_REQUEST_FAILED",
+            "details": str(exc),
+        }
+
+# ============================================================
+# 8. MODUL SO'ROVLARINI BOSHQARISH
+# ============================================================
+
+async def send_module_approval_request(
+    module_name: str,
+    permissions: Optional[list] = None,
+    description: str = ""
+):
+    """Yangi modul uchun Admin tasdiqlash so'rovini yuboradi."""
+    if not module_name:
+        return None
+
+    token = uuid.uuid4().hex
+
+    request_data = {
+        "token": token,
+        "module_name": module_name,
+        "permissions": list(permissions or []),
+        "description": description,
+        "created_at": utc_now(),
+        "status": "PENDING",
+    }
+
+    module_requests[token] = request_data
+    pending_module_requests[token] = request_data
+
+    try:
+        keyboard = module_review_keyboard(token)
+
+        message_text = (
+            "Yangi modul tasdiqlash uchun yuborildi.\n\n"
+            f"Modul: {module_name}\n"
+            f"Ruxsatlar: {', '.join(request_data['permissions']) or 'Ko‘rsatilmagan'}\n"
+            f"Tavsif: {description or 'Mavjud emas'}\n"
+            f"Token: {token}"
+        )
+
+        await send_admin_message(
+            message_text,
+            reply_markup=keyboard
+        )
+
+        await security_report(
+            "MODULE_APPROVAL_REQUEST_RECEIVED",
+            request_data
+        )
+
+        return token
+
+    except Exception:
+        logger.exception("Modul tasdiqlash so'rovini yuborib bo'lmadi")
+        module_requests.pop(token, None)
+        pending_module_requests.pop(token, None)
+        return None
+
+async def activate_gateway_module(
+    module_name: str,
+    permissions: Optional[list] = None
+):
+    """Tasdiqlangan modulni Gateway orqali faollashtiradi."""
+    if supra_gateway is None:
+        return False
+
+    approve = getattr(
+        supra_gateway,
+        "approve_module",
+        None
+    )
+
+    if not callable(approve):
+        return False
+
+    try:
+        result = await call_maybe_async(
+            approve,
+            name=module_name,
+            approved_capabilities=list(permissions or []),
+        )
+        return result is not False
+    except Exception:
+        logger.exception("Gateway modulni faollashtira olmadi")
+        return False
+
+async def _security_module_already_approved(
+    module_name: str,
+    permissions: list
+) -> bool:
+    """Xavfsizlik markazida modul avval tasdiqlanganini tekshiradi."""
+    if security_center is None:
+        return False
+
+    verifier = getattr(
+        security_center,
+        "verify_module_approval",
+        None
+    )
+
+    if not callable(verifier):
+        return False
+
+    try:
+        return bool(
+            await call_maybe_async(
+                verifier,
+                module_name,
+                permissions
+            )
+        )
+    except TypeError:
+        try:
+            return bool(
+                await call_maybe_async(
+                    verifier,
+                    module_name=module_name,
+                    capabilities=permissions,
+                )
+            )
+        except Exception:
+            logger.exception("Modul tasdig'ini tekshirishda xatolik")
+            return False
+    except Exception:
+        logger.exception("Modul tasdig'ini tekshirishda xatolik")
+        return False
+
+async def _review_module_in_security_center(
+    module_name: str,
+    approved: bool,
+    permissions: list
+):
+    """Xavfsizlik markazida modul so'rovini ko'rib chiqadi."""
+    if security_center is None:
+        return False
+
+    reviewer = getattr(
+        security_center,
+        "review_module",
+        None
+    )
+
+    if not callable(reviewer):
+        return False
+
+    # Turli interfeys nomlari bilan ishlaydigan moslashuv.
+    try:
+        return await call_maybe_async(
+            reviewer,
+            module_name=module_name,
+            approved=approved,
+            permissions=permissions,
+            admin_id=ADMIN_ID,
+        )
+    except TypeError:
+        pass
+
+    try:
+        return await call_maybe_async(
+            reviewer,
+            module_name,
+            approved,
+            permissions,
+        )
+    except TypeError:
+        pass
+
+    try:
+        return await call_maybe_async(
+            reviewer,
+            module_name,
+            approved,
+        )
+    except Exception:
+        logger.exception("Modul so'rovini ko'rib chiqib bo'lmadi")
+        return False
+
+async def handle_module_review(
+    token: str,
+    approved: bool,
+    admin_id: Any
+):
+    """
+    Modul tasdiqlash/rad etish jarayoni.
+
+    Xavfsizlik markazida avval tasdiqlangan, ammo Gateway
+    faollashtirishida xato yuz bergan modul qayta ko'rib
+    chiqilmaydi — Gateway faollashtirish qayta uriniladi.
+    """
+    if not await admin_verified(admin_id):
+        await security_report(
+            "UNAUTHORIZED_MODULE_REVIEW",
+            {
+                "admin_id": admin_id,
+                "token": token,
+            }
+        )
+        return False
+
+    request_data = pending_module_requests.get(token)
+
+    if request_data is None:
+        return False
+
+    module_name = request_data["module_name"]
+    permissions = request_data.get("permissions", [])
+
+    if not approved:
+        result = await _review_module_in_security_center(
+            module_name,
+            False,
+            permissions,
+        )
+
+        if result is False:
+            return False
+
+        request_data["status"] = "REJECTED"
+        pending_module_requests.pop(token, None)
+
+        await record_admin_activity(
+            "MODULE_REJECTED",
+            {
+                "module": module_name,
+                "token": token,
+            }
+        )
+
+        return True
+
+    already_approved = await _security_module_already_approved(
+        module_name,
+        permissions,
+    )
+
+    if not already_approved:
+        review_result = await _review_module_in_security_center(
+            module_name,
+            True,
+            permissions,
+        )
+
+        if review_result is False:
+            return False
+
+    gateway_result = await activate_gateway_module(
+        module_name,
