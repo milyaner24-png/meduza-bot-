@@ -1,1 +1,6 @@
-aiogram>=3.13,<4
+aiogram>=3.10.0
+python-dotenv
+gTTS
+playwright
+google-genai
+aiofiles
